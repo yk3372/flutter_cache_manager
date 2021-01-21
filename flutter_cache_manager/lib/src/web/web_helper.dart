@@ -10,6 +10,7 @@ import 'package:flutter_cache_manager/src/cache_store.dart';
 import 'package:flutter_cache_manager/src/web/file_service.dart';
 import 'package:flutter_cache_manager/src/result/file_info.dart';
 import 'package:flutter_cache_manager/src/web/queue_item.dart';
+import 'package:flutter_cache_manager/src/web/queue_manager.dart';
 import 'package:pedantic/pedantic.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:uuid/uuid.dart';
@@ -24,13 +25,14 @@ const statusCodesFileNotChanged = [HttpStatus.notModified];
 class WebHelper {
   WebHelper(this._store, FileService fileFetcher)
       : _memCache = {},
-        fileFetcher = fileFetcher ?? HttpFileService();
+        fileFetcher = fileFetcher ?? HttpFileService(),
+        _queue =  QueueManager(fileFetcher.concurrentFetches);
 
   final CacheStore _store;
   @visibleForTesting
   final FileService fileFetcher;
   final Map<String, BehaviorSubject<FileResponse>> _memCache;
-  final Queue<QueueItem> _queue = Queue();
+  final QueueManager _queue;
 
   ///Download the file from the url
   Stream<FileResponse> downloadFile(String url,
@@ -41,44 +43,30 @@ class WebHelper {
     if (!_memCache.containsKey(key) || ignoreMemCache) {
       var subject = BehaviorSubject<FileResponse>();
       _memCache[key] = subject;
-      unawaited(_downloadOrAddToQueue(url, key, authHeaders));
+      unawaited(_downloadQueued(url, key, authHeaders));
     }
     return _memCache[key].stream;
   }
 
-  var concurrentCalls = 0;
-  Future<void> _downloadOrAddToQueue(
+  Future<void> _downloadQueued(
     String url,
     String key,
     Map<String, String> authHeaders,
   ) async {
-    //Add to queue if there are too many calls.
-    if (concurrentCalls >= fileFetcher.concurrentFetches) {
-      _queue.add(QueueItem(url, key, authHeaders));
-      return;
-    }
-
-    concurrentCalls++;
-    var subject = _memCache[key];
-    try {
-      await for (var result
-          in _updateFile(url, key, authHeaders: authHeaders)) {
-        subject.add(result);
+    await _queue.runQueued(() async {
+      var subject = _memCache[key];
+      try {
+        await for (var result
+        in _updateFile(url, key, authHeaders: authHeaders)) {
+          subject.add(result);
+        }
+      } catch (e, stackTrace) {
+        subject.addError(e, stackTrace);
+      } finally {
+        await subject.close();
+        _memCache.remove(key);
       }
-    } catch (e, stackTrace) {
-      subject.addError(e, stackTrace);
-    } finally {
-      concurrentCalls--;
-      await subject.close();
-      _memCache.remove(key);
-      _checkQueue();
-    }
-  }
-
-  void _checkQueue() {
-    if (_queue.isEmpty) return;
-    var next = _queue.removeFirst();
-    _downloadOrAddToQueue(next.url, next.key, next.headers);
+    });
   }
 
   ///Download the file from the url
